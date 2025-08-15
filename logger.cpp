@@ -1,64 +1,36 @@
+#include <iostream>
 
-#pragma once
-
-#include <chrono>
-#include <iomanip>
-#include <sstream>
-#include <string>
-
-#include <windows.h>
-
-#include "common.h"
+#include "utils.h"
 #include "logger.h"
 
-#define LOG_DEBUG_ENABLED
-#define LOG_INFO_ENABLED
-#define LOG_ERROR_ENABLED
+namespace CrashSender {
 
-static const std::string LOG_FILENAME = "L2CrashSender.log";
-
-[[nodiscard]]
-std::string GetCurrentTimestamp() noexcept {
-    try {
-        const auto now = std::chrono::system_clock::now();
-        const auto time_t = std::chrono::system_clock::to_time_t(now);
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
-        tm tm;
-        localtime_s(&tm, &time_t);
-
-        std::stringstream ss;
-        ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
-        ss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-        return ss.str();
-    }
-    catch (...) {
-        return "TIMESTAMP_ERROR";
-    }
+Logger& Logger::GetInstance() noexcept {
+    static Logger instance;
+    return instance;
 }
 
 Logger::Logger() {
     try {
-        logFile.open(LOG_FILENAME, std::ios::out);
-        if (!logFile.is_open()) {
-            throw std::exception();
+        log_file_.open("L2CrashSender.log", std::ios::out);
+        if (log_file_.is_open()) {
+            is_initialized_ = true;
+            LogImpl(LogLevel::Info, "L2CrashSender started");
         }
-        logFile << GetCurrentTimestamp() << " [INF] L2CrashSender started\n";
     }
     catch (...) {
-        throw std::exception("Warning: Failed to initialize logging");
+        // Continue without logging if a file cannot be opened
+        is_initialized_ = false;
     }
 }
 
 Logger::~Logger() {
     try {
-        if (!logFile.is_open()) {
-            return;
+        if (is_initialized_ && log_file_.is_open()) {
+            LogImpl(LogLevel::Info, "L2CrashSender finished");
+            log_file_.flush();
+            log_file_.close();
         }
-
-        logFile << GetCurrentTimestamp() << " [INF] L2CrashSender finished\n";
-        logFile.flush();
-        logFile.close();
     }
     catch (...) {
         // Ignore errors during cleanup
@@ -66,54 +38,42 @@ Logger::~Logger() {
 }
 
 void Logger::Debug(std::string_view message) noexcept {
-#ifdef LOG_DEBUG_ENABLED
-    Log(LogLevel::Debug, message);
-#endif // LOG_DEBUG_ENABLED  
+    LogImpl(LogLevel::Debug, message);
 }
 
 void Logger::Debug(std::wstring_view message) noexcept {
-#ifdef LOG_DEBUG_ENABLED
-    Log(LogLevel::Debug, message);
-#endif  // LOG_DEBUG_ENABLED  
-}
-
-void Logger::Info(std::wstring_view message) noexcept {
-#ifdef LOG_INFO_ENABLED
-    Log(LogLevel::Info, message);
-#endif  // LOG_INFO_ENABLED  
+    LogImpl(LogLevel::Debug, TextUtils::WideToUtf8(message));
 }
 
 void Logger::Info(std::string_view message) noexcept {
-#ifdef LOG_INFO_ENABLED
-    Log(LogLevel::Info, message);
-#endif  // LOG_INFO_ENABLED  
+    LogImpl(LogLevel::Info, message);
+}
+
+void Logger::Info(std::wstring_view message) noexcept {
+    LogImpl(LogLevel::Info, TextUtils::WideToUtf8(message));
 }
 
 void Logger::Error(std::string_view message) noexcept {
-#ifdef LOG_ERROR_ENABLED
-    Log(LogLevel::Error, message);
-#endif  // LOG_ERROR_ENABLED  
+    LogImpl(LogLevel::Error, message);
 }
 
 void Logger::Error(std::wstring_view message) noexcept {
-#ifdef LOG_ERROR_ENABLED
-    Log(LogLevel::Error, message);
-#endif  // LOG_ERROR_ENABLED  
+    LogImpl(LogLevel::Error, TextUtils::WideToUtf8(message));
 }
 
-void Logger::Log(LogLevel level, std::wstring_view message) noexcept {
-    Log(level, WideToUtf8(message));
-}
+void Logger::LogImpl(LogLevel level, std::string_view message) noexcept {
+    if (!is_initialized_) {
+        return;
+    }
 
-void Logger::Log(LogLevel level, std::string_view message) noexcept {
     try {
-        static const Logger guard{};
-        if (!Logger::logFile.is_open()) {
-            return;
+        if (log_file_.is_open()) {
+            log_file_ << TimeUtils::GetCurrentTimestamp() << " [" << LogLevelToString(level) << "] " << message << '\n';
+            log_file_.flush(); // Ensure immediate write for crash reporting tool
         }
-        
-        Logger::logFile << GetCurrentTimestamp() << " [" << LogLevelToString(level) << "] " << message << '\n';
     } catch (...) {
-        // Ignore logging errors
+        // Ignore logging errors to prevent cascading failures
     }
 }
+
+} // namespace CrashSender

@@ -20,10 +20,18 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 if(WIN32)
     # Create the executable
     add_executable(L2CrashSender
-        "logger.cpp"
+        "crash_report_data.h"
+        "crash_report_data.cpp"
+        "command_line_parser.h"
+        "command_line_parser.cpp"
+        "utils.h"
+        "utils.cpp"
+        "http_client.h"
+        "http_client.cpp"
         "logger.h"
-        "main.cpp"
+        "logger.cpp"
         "main.h"
+        "main.cpp"
      )
 
     # Set target properties
