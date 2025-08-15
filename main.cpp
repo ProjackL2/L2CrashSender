@@ -1,355 +1,420 @@
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <sstream>
+
 #include <windows.h>
 #include <wininet.h>
-#include <string>
-#include <vector>
-#include <iostream>
-#include <fstream>
-#include <chrono>
-#include <iomanip>
-#include <sstream>
-#include <mutex>
-
-#include "log.hpp"
-
 #pragma comment(lib, "wininet.lib")
 
-// Structure to hold crash report data
-struct CrashReportData {
-    std::wstring url;        // Server URL
-    std::wstring version;    // Application version
-    std::wstring error;      // Error description
-    std::wstring dump_path;  // Path to dump file
-    std::wstring temp_path;  // Temporary file path
-    std::wstring full_url;   // Complete URL with path
-    std::wstring server_path; // Server path component
-};
+#include "common.h"
+#include "logger.h"
+#include "main.h"
 
-// Forward declarations
-void ParseCommandLineArguments(int argc, wchar_t* argv[], CrashReportData& crashData);
-void InitializeCrashReportData(CrashReportData& crashData);
-void ProcessServerUrl(CrashReportData& crashData);
-HINTERNET SendCrashReport(const CrashReportData& crashData);
-void CreateMultiPartFormData(const CrashReportData& crashData, std::vector<char>& formData);
-void ParseCommandLineParameter(int argc, wchar_t* argv[], const wchar_t* parameter, std::wstring& output);
-bool ReadFileToBuffer(const wchar_t* filename, std::vector<char>& buffer);
-void CleanupTempFiles(const CrashReportData& crashData);
+class InternetHandle {
+public:
+    InternetHandle() = default;
 
-// Parse command line arguments and extract crash report parameters
-void ParseCommandLineArguments(int argc, wchar_t* argv[], CrashReportData& crashData) {
-    if (argc < 4) {
-        LogA(LogLevel::Warn, "Insufficient command line arguments");
-        return;
+    explicit InternetHandle(HINTERNET handle) noexcept
+        : handle_(handle) {
     }
 
-    // Parse -url= parameter
-    ParseCommandLineParameter(argc, argv, L"-url=", crashData.url);
-
-    // Parse -version= parameter
-    ParseCommandLineParameter(argc, argv, L"-version=", crashData.version);
-
-    // Parse -error= parameter
-    ParseCommandLineParameter(argc, argv, L"-error=", crashData.error);
-
-    // Parse -dump= parameter (path to crash dump file)
-    ParseCommandLineParameter(argc, argv, L"-dump=", crashData.dump_path);
-}
-
-// Extract parameter value from command line
-void ParseCommandLineParameter(int argc, wchar_t* argv[], const wchar_t* parameter, std::wstring& output) {
-    for (int i = 0; i < argc; i++) {
-        const wchar_t* pos = wcsstr(argv[i], parameter);
-        if (pos) {
-            pos += wcslen(parameter); // Move past parameter name
-            output.assign(pos, wcslen(pos));
-            break;
+    ~InternetHandle() noexcept {
+        if (handle_) {
+            InternetCloseHandle(handle_);
         }
     }
+
+    InternetHandle(const InternetHandle&) = delete;
+    InternetHandle& operator=(const InternetHandle&) = delete;
+
+    [[nodiscard]]
+    HINTERNET get() const noexcept {
+        return handle_;
+    }
+
+    [[nodiscard]]
+    explicit operator bool() const noexcept {
+        return handle_ != nullptr;
+    }
+
+private:
+    HINTERNET handle_ = nullptr;
+};
+
+void CrashReportData::clear() noexcept {
+    url.clear();
+    version.clear();
+    temp_path.clear();
+    error.clear();
+    dump_path.clear();
+    full_url.clear();
+    server_path.clear();
 }
 
-// Initialize crash report data structure
-void InitializeCrashReportData(CrashReportData& crashData) {
-    // Initialize all string members to empty
-    crashData.url.clear();
-    crashData.version.clear();
-    crashData.error.clear();
-    crashData.dump_path.clear();
-    crashData.temp_path.clear();
-    crashData.full_url.clear();
-    crashData.server_path.clear();
+void ParseCommandLineArguments(int argc, wchar_t* argv[], CrashReportData& crashData) {
+    if (argc < 5) {
+        throw std::exception("Insufficient command line arguments");
+    }
+
+    // Parse parameters
+    ParseCommandLineParameter(argc, argv, L"-url=", crashData.url);
+    ParseCommandLineParameter(argc, argv, L"-version=", crashData.version);
+    ParseCommandLineParameter(argc, argv, L"-error=", crashData.temp_path);
+    ParseCommandLineParameter(argc, argv, L"-dump=", crashData.dump_path);
+
+    ProcessErrorContent(crashData);
+    ProcessServerUrl(crashData);
 }
 
-// Process and validate the server URL
-void ProcessServerUrl(CrashReportData& crashData) {
-    const std::wstring httpPrefix = L"http://";
+void ParseCommandLineParameter(int argc, wchar_t* const argv[], std::wstring_view parameter, std::wstring& output) noexcept {
+    try {
+        for (int i = 0; i < argc; ++i) {
+            if (!argv[i]) continue;
+            
+            const std::wstring_view arg(argv[i]);
+            if (arg.starts_with(parameter)) {
+                output = arg.substr(parameter.length());
+                break;
+            }
+        }
+    } catch (...) {
+        // Ignore parsing errors
+    }
+}
 
-    size_t httpPos = crashData.url.find(httpPrefix);
-    size_t startPos = (httpPos != std::wstring::npos) ? httpPos + 7 : 0;
+void ProcessErrorContent(CrashReportData& crashData) noexcept {
+    try {
+        std::vector<char> errorFileData;
+        if (!ReadFileToBuffer(crashData.temp_path, errorFileData)) {
+            Logger::Error("Failed to read error file");
+            return;
+        }
+        crashData.error = std::wstring((wchar_t*)(errorFileData.data()), errorFileData.size() / 2);
+    }
+    catch (...) {
+        crashData.error = L"Not parsed";
+    }
+}
 
-    // Extract server part and path part
-    std::wstring urlPart = crashData.url.substr(startPos);
-    size_t slashPos = urlPart.find(L"/");
+void ProcessServerUrl(CrashReportData& crashData) noexcept {
+    try {
+        constexpr std::wstring_view httpPrefix = L"http://";
 
-    if (slashPos != std::wstring::npos) {
-        // URL has path component
-        crashData.full_url = urlPart.substr(0, slashPos);
-        crashData.server_path = urlPart.substr(slashPos);
-    } else {
-        // No path component, use entire URL as server
-        crashData.full_url = urlPart;
+        size_t startPos = 0;
+        if (const auto httpPos = crashData.url.find(httpPrefix); httpPos != std::wstring::npos) {
+            startPos = httpPos + httpPrefix.length();
+        }
+
+        const std::wstring urlPart = crashData.url.substr(startPos);
+        if (const auto slashPos = urlPart.find(L'/'); slashPos != std::wstring::npos) {
+            crashData.full_url = urlPart.substr(0, slashPos);
+            crashData.server_path = urlPart.substr(slashPos);
+        } else {
+            crashData.full_url = urlPart;
+            crashData.server_path = L"/";
+        }
+    } catch (...) {
+        crashData.full_url = crashData.url;
         crashData.server_path = L"/";
     }
 }
 
-// Create multipart form data for HTTP POST
 void CreateMultiPartFormData(const CrashReportData& crashData, std::vector<char>& formData) {
-    std::string boundary = "--MULTIPART-DATA-BOUNDARY";
-    std::string crlf = "\r\n";
+    try {
+        constexpr std::string_view boundary = "--MULTIPART-DATA-BOUNDARY";
+        constexpr std::string_view crlf = "\r\n";
 
-    formData.clear();
+        formData.clear();
 
-    // Add version field
-    std::string versionPart = boundary + crlf +
-        "Content-Disposition: form-data; name=\"CRVersion\"" + crlf + crlf;
-    formData.insert(formData.end(), versionPart.begin(), versionPart.end());
+        auto appendString = [&formData](std::string_view str) {
+            formData.insert(formData.end(), str.begin(), str.end());
+        };
 
-    // Convert version to UTF-8
-    int versionLen = WideCharToMultiByte(CP_UTF8, 0, crashData.version.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (versionLen > 1) {
-        std::vector<char> versionUtf8(versionLen);
-        WideCharToMultiByte(CP_UTF8, 0, crashData.version.c_str(), -1, versionUtf8.data(), versionLen, nullptr, nullptr);
-        formData.insert(formData.end(), versionUtf8.begin(), versionUtf8.end() - 1); // Exclude null terminator
+        auto appendWideString = [&formData](const std::wstring& wstr) {
+            const std::string utf8Str = WideToUtf8(wstr);
+            formData.insert(formData.end(), utf8Str.begin(), utf8Str.end());
+        };
+
+        // Add version field
+        appendString(boundary);
+        appendString(crlf);
+        appendString("Content-Disposition: form-data; name=\"CRVersion\"");
+        appendString(crlf);
+        appendString(crlf);
+        appendWideString(crashData.version);
+        appendString(crlf);
+
+        // Add error field
+        appendString(boundary);
+        appendString(crlf);
+        appendString("Content-Disposition: form-data; name=\"error\"");
+        appendString(crlf);
+        appendString(crlf);
+        appendWideString(crashData.error);
+        appendString(crlf);
+
+        // Add dump file field
+        appendString(boundary);
+        appendString(crlf);
+        appendString("Content-Disposition: form-data; name=\"dumpfile\"; filename=\"");
+
+        // Extract filename from path using std::filesystem
+        try {
+            const std::filesystem::path path(crashData.dump_path);
+            const std::wstring filename = path.filename().wstring();
+            appendWideString(filename);
+        } catch (...) {
+            // Fallback: use the whole path as filename
+            appendWideString(crashData.dump_path);
+        }
+
+        appendString("\"");
+        appendString(crlf);
+        appendString("Content-Type: application/octet-stream");
+        appendString(crlf);
+        appendString(crlf);
+    } catch (...) {
+        formData.clear();
+        Logger::Error("Failed to create multipart form data");
     }
-    formData.insert(formData.end(), crlf.begin(), crlf.end());
-
-    // Add error field
-    std::string errorPart = boundary + crlf +
-        "Content-Disposition: form-data; name=\"error\"" + crlf + crlf;
-    formData.insert(formData.end(), errorPart.begin(), errorPart.end());
-
-    // Convert error to UTF-8
-    int errorLen = WideCharToMultiByte(CP_UTF8, 0, crashData.error.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (errorLen > 1) {
-        std::vector<char> errorUtf8(errorLen);
-        WideCharToMultiByte(CP_UTF8, 0, crashData.error.c_str(), -1, errorUtf8.data(), errorLen, nullptr, nullptr);
-        formData.insert(formData.end(), errorUtf8.begin(), errorUtf8.end() - 1); // Exclude null terminator
-    }
-    formData.insert(formData.end(), crlf.begin(), crlf.end());
-
-    // Add dump file field
-    std::string dumpPart = boundary + crlf +
-        "Content-Disposition: form-data; name=\"dumpfile\"; filename=\"";
-    formData.insert(formData.end(), dumpPart.begin(), dumpPart.end());
-
-    // Extract filename from path
-    const wchar_t* dumpPath = crashData.dump_path.c_str();
-    const wchar_t* filename = wcsrchr(dumpPath, L'\\');
-    if (filename) {
-        filename++; // Skip the backslash
-    } else {
-        filename = dumpPath;
-    }
-
-    // Convert filename to UTF-8
-    int filenameLen = WideCharToMultiByte(CP_UTF8, 0, filename, -1, nullptr, 0, nullptr, nullptr);
-    if (filenameLen > 1) {
-        std::vector<char> filenameUtf8(filenameLen);
-        WideCharToMultiByte(CP_UTF8, 0, filename, -1, filenameUtf8.data(), filenameLen, nullptr, nullptr);
-        formData.insert(formData.end(), filenameUtf8.begin(), filenameUtf8.end() - 1); // Exclude null terminator
-    }
-
-    std::string dumpHeader = "\"" + crlf + "Content-Type: application/octet-stream" + crlf + crlf;
-    formData.insert(formData.end(), dumpHeader.begin(), dumpHeader.end());
 }
 
 // Read file contents into buffer
-bool ReadFileToBuffer(const wchar_t* filename, std::vector<char>& buffer) {
-    Log(LogLevel::Info, L"Reading file: " + std::wstring(filename));
-    
-    HANDLE hFile = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        Log(LogLevel::Error, L"Failed to open file: " + std::wstring(filename));
-        return false;
-    }
+[[nodiscard]]
+bool ReadFileToBuffer(std::wstring_view filename, std::vector<char>& buffer) noexcept {
+    try {
+        Logger::Debug(std::wstring(L"Reading file: ") + std::wstring(filename));
+        
+        // Use Windows API for better control
+        const HANDLE hFile = CreateFileW(filename.data(), GENERIC_READ, FILE_SHARE_READ, 
+                                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            Logger::Error(std::wstring(L"Failed to open file: ") + std::wstring(filename));
+            return false;
+        }
 
-    LARGE_INTEGER fileSize;
-    if (!GetFileSizeEx(hFile, &fileSize)) {
-        LogA(LogLevel::Error, "Failed to get file size");
-        CloseHandle(hFile);
-        return false;
-    }
+        // RAII wrapper for file handle
+        struct FileHandleGuard {
+            HANDLE handle;
+            explicit FileHandleGuard(HANDLE h) : handle(h) {}
+            ~FileHandleGuard() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+        } fileGuard(hFile);
 
-    LogA(LogLevel::Info, "File size: " + std::to_string(fileSize.QuadPart) + " bytes");
-    buffer.resize(static_cast<size_t>(fileSize.QuadPart));
+        LARGE_INTEGER fileSize;
+        if (!GetFileSizeEx(hFile, &fileSize)) {
+            Logger::Error("Failed to get file size");
+            return false;
+        }
 
-    DWORD bytesRead = 0;
-    BOOL success = ReadFile(hFile, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr);
+        if (fileSize.QuadPart > SIZE_MAX) {
+            Logger::Error("File too large to read into memory");
+            return false;
+        }
 
-    CloseHandle(hFile);
+        Logger::Debug("File size: " + std::to_string(fileSize.QuadPart) + " bytes");
+        buffer.resize(static_cast<size_t>(fileSize.QuadPart));
 
-    if (!success || bytesRead != buffer.size()) {
-        LogA(LogLevel::Error, "Failed to read file contents");
+        DWORD bytesRead = 0;
+        const BOOL success = ReadFile(hFile, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr);
+
+        if (!success || bytesRead != buffer.size()) {
+            Logger::Error("Failed to read file contents");
+            buffer.clear();
+            return false;
+        }
+
+        Logger::Debug("File read successfully");
+        return true;
+    } catch (...) {
+        Logger::Error("Exception occurred while reading file");
         buffer.clear();
         return false;
     }
-
-    LogA(LogLevel::Info, "File read successfully");
-    return true;
 }
 
-// Send crash report via HTTP POST
-HINTERNET SendCrashReport(const CrashReportData& crashData) {
-    LogA(LogLevel::Info, "Initializing HTTP connection");
-    HINTERNET hInternet = InternetOpenW(L"CrashReport", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
-    if (!hInternet) {
-        LogA(LogLevel::Error, "Failed to initialize WinINet");
-        return nullptr;
+bool SendCrashReport(const CrashReportData& crashData) noexcept {
+    try {
+        Logger::Info(L"Try to send crash report to " + crashData.full_url);
+        
+        InternetHandle hInternet(InternetOpenW(L"CrashReport", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0));
+        if (!hInternet) {
+            Logger::Error("Failed to initialize WinINet");
+            return {};
+        }
+
+        // Connect to server
+        Logger::Debug(L"Connecting to server: " + crashData.full_url);
+        InternetHandle hConnect(InternetConnectW(
+            hInternet.get(),
+            crashData.full_url.c_str(),
+            INTERNET_DEFAULT_HTTP_PORT,
+            nullptr, nullptr,
+            INTERNET_SERVICE_HTTP,
+            0, 0
+        ));
+
+        if (!hConnect) {
+            Logger::Error("Failed to connect to server");
+            return {};
+        }
+
+        // Create HTTP request
+        Logger::Debug(L"Creating HTTP POST request to: " + crashData.server_path);
+        InternetHandle hRequest(HttpOpenRequestW(
+            hConnect.get(),
+            L"POST",
+            crashData.server_path.c_str(),
+            L"HTTP/1.1",
+            nullptr, nullptr,
+            INTERNET_FLAG_NO_CACHE_WRITE,
+            0
+        ));
+
+        if (!hRequest) {
+            Logger::Error("Failed to create HTTP request");
+            return {};
+        }
+
+        // Prepare multipart form data
+        Logger::Debug("Creating multipart form data");
+        std::vector<char> formHeader;
+        CreateMultiPartFormData(crashData, formHeader);
+
+        std::vector<char> dumpFileData;
+        if (!ReadFileToBuffer(crashData.dump_path, dumpFileData)) {
+            Logger::Error("Failed to read dump file");
+            return {};
+        }
+
+        constexpr std::string_view boundary = "\r\n--MULTIPART-DATA-BOUNDARY--";
+        std::vector<char> formFooter(boundary.begin(), boundary.end());
+
+        // Set HTTP headers
+        constexpr const wchar_t* headers =
+            L"Content-Transfer-Encoding: binary\r\n"
+            L"Content-Type: multipart/form-data; charset=UTF-8; boundary=MULTIPART-DATA-BOUNDARY\r\n";
+
+        if (!HttpAddRequestHeadersW(hRequest.get(), headers, static_cast<DWORD>(-1), HTTP_ADDREQ_FLAG_ADD | HTTP_ADDREQ_FLAG_REPLACE)) {
+            Logger::Error("Failed to add HTTP headers");
+            return {};
+        }
+
+        // Calculate total content length
+        const auto totalLength = static_cast<DWORD>(formHeader.size() + dumpFileData.size() + formFooter.size());
+        Logger::Debug("Total upload size: " + std::to_string(totalLength) + " bytes");
+
+        // Prepare request
+        INTERNET_BUFFERSW buffers{};
+        buffers.dwStructSize = sizeof(INTERNET_BUFFERSW);
+        buffers.dwBufferTotal = totalLength;
+
+        if (!HttpSendRequestExW(hRequest.get(), &buffers, nullptr, 0, 0)) {
+            Logger::Error("Failed to prepare HTTP request");
+            return {};
+        }
+
+        // Send form data
+        Logger::Debug("Uploading crash report data");
+        DWORD bytesWritten = 0;
+        
+        if (!InternetWriteFile(hRequest.get(), formHeader.data(), static_cast<DWORD>(formHeader.size()), &bytesWritten) ||
+            !InternetWriteFile(hRequest.get(), dumpFileData.data(), static_cast<DWORD>(dumpFileData.size()), &bytesWritten) ||
+            !InternetWriteFile(hRequest.get(), formFooter.data(), static_cast<DWORD>(formFooter.size()), &bytesWritten)) {
+            Logger::Error("Failed to upload data");
+            return {};
+        }
+
+        // Complete the request
+        Logger::Debug("Finalizing HTTP request");
+        if (!HttpEndRequestW(hRequest.get(), nullptr, 0, 0)) {
+            Logger::Error("Failed to finalize HTTP request");
+            return {};
+        }
+
+        // Check HTTP status code
+        DWORD statusCode = 0;
+        DWORD statusCodeSize = sizeof(statusCode);
+        if (!HttpQueryInfoW(hRequest.get(),
+            HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+            &statusCode,
+            &statusCodeSize,
+            nullptr)) {
+            Logger::Error("Failed to query HTTP status");
+            return false;
+        }
+
+        Logger::Debug("Server responded with status: " + std::to_string(statusCode));
+
+        // Read response body (if any)
+        std::string responseBody;
+        char buffer[4096];
+        DWORD bytesRead = 0;
+
+        while (InternetReadFile(hRequest.get(), buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+            responseBody.append(buffer, bytesRead);
+        }
+      
+        // Validate success status (2xx)
+        if (statusCode < 200 || statusCode >= 300) {
+            Logger::Error("Server rejected crash report");
+            if (!responseBody.empty()) {
+                Logger::Error("Server response: " + responseBody);
+            }
+            return false;
+        }
+        return true;
+    } catch (...) {
+        Logger::Error("Exception occurred during HTTP request");
+        return false;
     }
-
-    // Connect to server
-    Log(LogLevel::Info, L"Connecting to server: " + crashData.full_url);
-    HINTERNET hConnect = InternetConnectW(
-        hInternet,
-        crashData.full_url.c_str(),
-        INTERNET_DEFAULT_HTTP_PORT,
-        nullptr, nullptr,
-        INTERNET_SERVICE_HTTP,
-        0, 0
-    );
-
-    if (!hConnect) {
-        LogA(LogLevel::Error, "Failed to connect to server");
-        InternetCloseHandle(hInternet);
-        return nullptr;
-    }
-
-    // Create HTTP request
-    Log(LogLevel::Info, L"Creating HTTP POST request to: " + crashData.server_path);
-    HINTERNET hRequest = HttpOpenRequestW(
-        hConnect,
-        L"POST",
-        crashData.server_path.c_str(),
-        L"HTTP/1.0",
-        nullptr, nullptr,
-        INTERNET_FLAG_NO_CACHE_WRITE,
-        0
-    );
-
-    if (!hRequest) {
-        LogA(LogLevel::Error, "Failed to create HTTP request");
-        InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
-        return nullptr;
-    }
-
-    // Prepare multipart form data
-    LogA(LogLevel::Info, "Creating multipart form data");
-    std::vector<char> formHeader;
-    CreateMultiPartFormData(crashData, formHeader);
-
-    std::vector<char> dumpFileData;
-    if (!ReadFileToBuffer(crashData.dump_path.c_str(), dumpFileData)) {
-        LogA(LogLevel::Error, "Failed to read dump file");
-        InternetCloseHandle(hRequest);
-        InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
-        return nullptr;
-    }
-
-    std::string boundary = "\r\n--MULTIPART-DATA-BOUNDARY--";
-    std::vector<char> formFooter(boundary.begin(), boundary.end());
-
-    // Set HTTP headers
-    const wchar_t* headers =
-        L"Content-Transfer-Encoding: binary\r\n"
-        L"Content-Type: multipart/form-data; charset=UTF-8; boundary=MULTIPART-DATA-BOUNDARY\r\n";
-
-    if (!HttpAddRequestHeadersW(hRequest, headers, static_cast<DWORD>(-1), HTTP_ADDREQ_FLAG_ADD | HTTP_ADDREQ_FLAG_REPLACE)) {
-        InternetCloseHandle(hRequest);
-        InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
-        return nullptr;
-    }
-
-    // Calculate total content length
-    DWORD totalLength = static_cast<DWORD>(formHeader.size() + dumpFileData.size() + formFooter.size());
-    LogA(LogLevel::Info, "Total upload size: " + std::to_string(totalLength) + " bytes");
-
-    // Prepare request
-    INTERNET_BUFFERSW buffers = {0};
-    buffers.dwStructSize = sizeof(INTERNET_BUFFERSW);
-    buffers.dwBufferTotal = totalLength;
-
-    if (!HttpSendRequestExW(hRequest, &buffers, nullptr, 0, 0)) {
-        LogA(LogLevel::Error, "Failed to prepare HTTP request");
-        InternetCloseHandle(hRequest);
-        InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
-        return nullptr;
-    }
-
-    // Send form data
-    LogA(LogLevel::Info, "Uploading crash report data");
-    DWORD bytesWritten;
-    InternetWriteFile(hRequest, formHeader.data(), static_cast<DWORD>(formHeader.size()), &bytesWritten);
-    InternetWriteFile(hRequest, dumpFileData.data(), static_cast<DWORD>(dumpFileData.size()), &bytesWritten);
-    InternetWriteFile(hRequest, formFooter.data(), static_cast<DWORD>(formFooter.size()), &bytesWritten);
-
-    // Complete the request
-    LogA(LogLevel::Info, "Finalizing HTTP request");
-    HttpEndRequestW(hRequest, nullptr, 0, 0);
-
-    // Cleanup
-    InternetCloseHandle(hRequest);
-    InternetCloseHandle(hConnect);
-
-    return hInternet;
 }
 
-void CleanupTempFiles(const CrashReportData& crashData) {
-    if (!crashData.temp_path.empty()) {
-        DeleteFileW(crashData.temp_path.c_str());
+void CleanupTempFiles(const CrashReportData& crashData) noexcept {
+    try {
+        if (!crashData.temp_path.empty()) {
+            DeleteFileW(crashData.temp_path.c_str());
+        }
+        if (!crashData.dump_path.empty()) {
+            DeleteFileW(crashData.dump_path.c_str());
+        }
+        Logger::Debug("Temporary files cleaned up");
+    } catch (...) {
+        Logger::Error("Failed to cleanup temporary files");
     }
 }
 
 int wmain(int argc, wchar_t* argv[]) {
-    std::setlocale(LC_ALL, "");
+    try {
+        std::setlocale(LC_ALL, "");
 
-    // Initialize logging
-    if (!InitializeLogging()) {
-        std::wcerr << L"Warning: Failed to initialize logging" << std::endl;
+        CrashReportData crashData{};
+
+        ParseCommandLineArguments(argc, argv, crashData);
+
+        Logger::Debug(L"Version: " + crashData.version);
+        Logger::Debug(L"Error: " + crashData.temp_path);
+        Logger::Debug(L"Dump path: " + crashData.dump_path);
+        Logger::Debug(L"URL: " + crashData.url);
+        Logger::Debug(L"Server: " + crashData.full_url);
+        Logger::Debug(L"Path: " + crashData.server_path);
+        
+        Logger::Info(L"Sending crash report to " + crashData.full_url);
+        if (SendCrashReport(crashData)) {
+            Logger::Info("Crash report sent successfully. Cleaning up temporary files");
+            CleanupTempFiles(crashData);
+        } else {
+            Logger::Error("Failed to send crash report");
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        Logger::Error("Unhandled exception: " + std::string(e.what()));
+        return 1;
+    } catch (...) {
+        Logger::Error("Unknown unhandled exception occurred");
+        return 1;
     }
-
-    auto crashData = CrashReportData{};
-
-    InitializeCrashReportData(crashData);
-    
-    LogA(LogLevel::Info, "Parsing command line arguments");
-    ParseCommandLineArguments(argc, argv, crashData);
-    
-    // Log parsed parameters
-    Log(LogLevel::Info, L"URL: " + crashData.url);
-    Log(LogLevel::Info, L"Version: " + crashData.version);
-    Log(LogLevel::Info, L"Error: " + crashData.error);
-    Log(LogLevel::Info, L"Dump path: " + crashData.dump_path);
-    
-    LogA(LogLevel::Info, "Processing server URL");
-    ProcessServerUrl(crashData);
-    
-    Log(LogLevel::Info, L"Server: " + crashData.full_url);
-    Log(LogLevel::Info, L"Path: " + crashData.server_path);
-
-    LogA(LogLevel::Info, "Sending crash report");
-    HINTERNET hInternet = SendCrashReport(crashData);
-    if (hInternet) {
-        LogA(LogLevel::Info, "Crash report sent successfully");
-        InternetCloseHandle(hInternet);
-
-        LogA(LogLevel::Info, "Cleaning up temporary files");
-        CleanupTempFiles(crashData);
-    } else {
-        LogA(LogLevel::Error, "Failed to send crash report");
-    }
-    
-    CloseLogging();
-    return 0;
 }
