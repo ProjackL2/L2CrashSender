@@ -6,11 +6,11 @@
 
 #include "logger.h"
 #include "utils.h"
-#include "command_line_parser.h"
+#include "crash_report_data_builder.h"
 
 namespace CrashSender {
 
-std::optional<CrashReportData> CommandLineParser::Parse(int argc, wchar_t* argv[], 
+std::optional<CrashReportData> CrashReportDataBuilder::ParseCommandLine(int argc, wchar_t* argv[], 
                                                         std::string& error_message) noexcept {
     try {
         if (argc < 5) {
@@ -41,14 +41,6 @@ std::optional<CrashReportData> CommandLineParser::Parse(int argc, wchar_t* argv[
             return std::nullopt;
         }
 
-        // Process error content and server URL
-        if (!ProcessErrorContent(data)) {
-            error_message = "Failed to process error file content";
-            return std::nullopt;
-        }
-
-        ProcessServerUrl(data);
-
         if (!data.IsValid()) {
             error_message = "Parsed data is invalid";
             return std::nullopt;
@@ -66,7 +58,7 @@ std::optional<CrashReportData> CommandLineParser::Parse(int argc, wchar_t* argv[
     }
 }
 
-bool CommandLineParser::ParseParameter(int argc, wchar_t* const argv[], 
+bool CrashReportDataBuilder::ParseParameter(int argc, wchar_t* const argv[], 
                                       std::wstring_view parameter, 
                                       std::wstring& output) noexcept {
     try {
@@ -88,7 +80,54 @@ bool CommandLineParser::ParseParameter(int argc, wchar_t* const argv[],
     }
 }
 
-bool CommandLineParser::ProcessErrorContent(CrashReportData& data) noexcept {
+void CrashReportDataBuilder::ProcessServerUrl(CrashReportData& data) noexcept {
+    try {
+        constexpr std::wstring_view http_prefix = L"http://";
+
+        size_t start_pos = 0;
+
+        if (const auto http_pos = data.url.find(http_prefix); http_pos != std::wstring::npos) {
+            start_pos = http_pos + http_prefix.length();
+        }
+
+        const std::wstring url_part = data.url.substr(start_pos);
+        if (const auto slash_pos = url_part.find(L'/'); slash_pos != std::wstring::npos) {
+            data.full_url = url_part.substr(0, slash_pos);
+            data.server_path = url_part.substr(slash_pos);
+        }
+        else {
+            data.full_url = url_part;
+            data.server_path = L"/";
+        }
+    }
+    catch (...) {
+        // Fallback to original URL parsing
+        data.full_url = data.url;
+        data.server_path = L"/";
+    }
+}
+
+void CrashReportDataBuilder::ProcessLogFiles(CrashReportData& data) noexcept {
+    try {
+        constexpr std::wstring_view game_log_path = L"L2.log";
+        constexpr std::wstring_view network_log_path = L"Network.log";
+
+        DWORD attributes = GetFileAttributesW(game_log_path.data());
+        if (attributes != INVALID_FILE_ATTRIBUTES) {
+            data.game_log_path = game_log_path;
+        }
+
+        attributes = GetFileAttributesW(network_log_path.data());
+        if (attributes != INVALID_FILE_ATTRIBUTES) {
+            data.network_log_path = network_log_path;
+        }
+    }
+    catch (...) {
+        // Non-critical failure
+    }
+}
+
+bool CrashReportDataBuilder::ProcessErrorContent(CrashReportData& data) noexcept {
     try {
         // Check if file exists using Windows API
         const DWORD attributes = GetFileAttributesW(data.temp_path.c_str());
@@ -141,32 +180,6 @@ bool CommandLineParser::ProcessErrorContent(CrashReportData& data) noexcept {
     catch (...) {
         data.error = L"Exception occurred while processing error content";
         return true; // Non-critical failure
-    }
-}
-
-void CommandLineParser::ProcessServerUrl(CrashReportData& data) noexcept {
-    try {
-        constexpr std::wstring_view http_prefix = L"http://";
-
-        size_t start_pos = 0;
-        
-        if (const auto http_pos = data.url.find(http_prefix); http_pos != std::wstring::npos) {
-            start_pos = http_pos + http_prefix.length();
-        }
-
-        const std::wstring url_part = data.url.substr(start_pos);
-        if (const auto slash_pos = url_part.find(L'/'); slash_pos != std::wstring::npos) {
-            data.full_url = url_part.substr(0, slash_pos);
-            data.server_path = url_part.substr(slash_pos);
-        } else {
-            data.full_url = url_part;
-            data.server_path = L"/";
-        }
-    } 
-    catch (...) {
-        // Fallback to original URL parsing
-        data.full_url = data.url;
-        data.server_path = L"/";
     }
 }
 

@@ -181,3 +181,4 @@ void OnApplicationCrash(const std::wstring& dumpPath, const std::wstring& errorD
     CreateProcess(nullptr, commandLine.data(), /* ... */);
 }
 ```
+

@@ -3,6 +3,7 @@
 #include "crash_report_data.h"
 #include <vector>
 #include <string>
+#include <string_view>
 
 namespace CrashSender {
 
@@ -21,6 +22,7 @@ public:
 
 private:
     static bool CreateMultipartFormData(const CrashReportData& data, std::vector<char>& output, std::string& error_message) noexcept;
+    static bool AddFileToMultipartData(std::string_view name, std::wstring_view filename, std::vector<char>& output, std::string& error_message) noexcept;
 };
 
 } // namespace CrashSender

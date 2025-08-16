@@ -80,13 +80,18 @@ int64_t FileUtils::GetFileSize(std::wstring_view filename) noexcept {
     }
 }
 
-bool FileUtils::ReadToBuffer(std::wstring_view filename, std::vector<char>& buffer, std::string& error_message) noexcept {
-    try {
-        Logger::LogDebug(L"Reading file: " + std::wstring(filename));
+bool FileUtils::AppendToBuffer(std::wstring_view filepath, std::vector<char>& buffer, std::string& error_message) noexcept {
+    const auto initinalSize = buffer.size();
 
-        const HANDLE file_handle = CreateFileW(filename.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    try {
+        const HANDLE file_handle = CreateFileW(filepath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file_handle == INVALID_HANDLE_VALUE) {
-            error_message = "Failed to open file: " + TextUtils::WideToUtf8(filename);
+            DWORD error = GetLastError();
+            if (error == ERROR_SHARING_VIOLATION) {
+                error_message = "Failed to open file(" + TextUtils::WideToUtf8(filepath) + "): File is busy with other process, need to patch process";
+            } else {
+                error_message = "Failed to open file: " + TextUtils::WideToUtf8(filepath);
+            }
             return false;
         }
 
@@ -106,13 +111,12 @@ bool FileUtils::ReadToBuffer(std::wstring_view filename, std::vector<char>& buff
         const auto size = static_cast<size_t>(file_size.QuadPart);
         Logger::LogDebug("File size: " + std::to_string(size) + " bytes");
 
-        buffer.resize(size);
+        buffer.resize(initinalSize + size);
 
         DWORD bytes_read = 0;
-        if (!ReadFile(file_handle, buffer.data(), static_cast<DWORD>(size), &bytes_read, nullptr) ||
-            bytes_read != size) {
+        if (!ReadFile(file_handle, buffer.data() + initinalSize, static_cast<DWORD>(size), &bytes_read, nullptr) || bytes_read != size) {
             error_message = "Failed to read file contents";
-            buffer.clear();
+            buffer.resize(initinalSize);
             return false;
         }
 
@@ -121,12 +125,12 @@ bool FileUtils::ReadToBuffer(std::wstring_view filename, std::vector<char>& buff
     }
     catch (const std::exception& e) {
         error_message = "Exception while reading file: " + std::string(e.what());
-        buffer.clear();
+        buffer.resize(initinalSize);
         return false;
     }
     catch (...) {
         error_message = "Unknown exception while reading file";
-        buffer.clear();
+        buffer.resize(initinalSize);
         return false;
     }
 }
@@ -170,6 +174,15 @@ std::string TextUtils::WideToUtf8(std::wstring_view wstr) noexcept {
     const int result = WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.length()), str.data(), len, nullptr, nullptr);
     return (result > 0) ? str : std::string{};
 }
+
+void TextUtils::AppendString(std::vector<char>& output, std::string_view str) noexcept {
+    output.insert(output.end(), str.begin(), str.end());
+};
+
+void TextUtils::AppendString(std::vector<char>& output, std::wstring_view wstr) noexcept {
+    const std::string utf8_str = WideToUtf8(wstr);
+    output.insert(output.end(), utf8_str.begin(), utf8_str.end());
+};
 
 std::string TimeUtils::GetCurrentTimestamp() noexcept {
     try {

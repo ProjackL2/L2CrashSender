@@ -13,7 +13,7 @@ void CrashReportData::Clear() noexcept {
 }
 
 bool CrashReportData::IsValid() const noexcept {
-    return !full_url.empty() &&  !version.empty() && !dump_path.empty() && !temp_path.empty();
+    return !url.empty() &&  !version.empty() && !dump_path.empty() && !temp_path.empty();
 }
 
 } // namespace CrashSender

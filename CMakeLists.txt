@@ -22,8 +22,8 @@ if(WIN32)
     add_executable(L2CrashSender
         "crash_report_data.h"
         "crash_report_data.cpp"
-        "command_line_parser.h"
-        "command_line_parser.cpp"
+        "crash_report_data_builder.h"
+        "crash_report_data_builder.cpp"
         "utils.h"
         "utils.cpp"
         "http_client.h"

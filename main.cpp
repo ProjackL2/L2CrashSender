@@ -4,7 +4,7 @@
 #include "utils.h"
 #include "logger.h"
 #include "crash_report_data.h"
-#include "command_line_parser.h"
+#include "crash_report_data_builder.h"
 #include "http_client.h"
 #include "main.h"
 
@@ -17,16 +17,26 @@ int RunApplication(int argc, wchar_t* argv[]) noexcept {
 
         // Parse command line arguments
         std::string parse_error;
-        const auto crash_data = CommandLineParser::Parse(argc, argv, parse_error);
+        auto crash_data = CrashReportDataBuilder::ParseCommandLine(argc, argv, parse_error);
         if (!crash_data) {
             Logger::LogError("Command line parsing failed: " + parse_error);
             return 1;
         }
 
+        CrashReportDataBuilder::ProcessServerUrl(crash_data.value());
+        CrashReportDataBuilder::ProcessLogFiles(crash_data.value());
+
+        if (!CrashReportDataBuilder::ProcessErrorContent(crash_data.value())) {
+            Logger::LogError("Failed to process error file content");
+            return 1;
+        }
+
         // Log parsed data for debugging
         Logger::LogDebug(L"Version: " + crash_data->version);
-        Logger::LogDebug(L"Error file: " + crash_data->temp_path);
+        Logger::LogDebug(L"Error file path: " + crash_data->temp_path);
         Logger::LogDebug(L"Dump path: " + crash_data->dump_path);
+        Logger::LogDebug(L"Game log path: " + crash_data->game_log_path);
+        Logger::LogDebug(L"Network log path: " + crash_data->network_log_path);
         Logger::LogDebug(L"URL: " + crash_data->url);
         Logger::LogDebug(L"Server: " + crash_data->full_url);
         Logger::LogDebug(L"Path: " + crash_data->server_path);
@@ -41,12 +51,9 @@ int RunApplication(int argc, wchar_t* argv[]) noexcept {
         Logger::LogInfo(L"Sending crash report to " + crash_data->full_url);
         std::string send_error;
         if (HttpClient::SendCrashReport(*crash_data, send_error)) {
-            Logger::LogInfo("Crash report sent successfully");
-            
             // Clean up temporary files on success
             FileUtils::CleanupTempFiles(*crash_data);
             Logger::LogInfo("Temporary files cleaned up");
-            
             return 0;
         } else {
             Logger::LogError("Failed to send crash report: " + send_error);

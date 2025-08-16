@@ -96,22 +96,6 @@ bool HttpClient::SendCrashReport(const CrashReportData& data, std::string& error
             return false;
         }
 
-        // Prepare multipart form data
-        std::vector<char> form_data;
-        if (!CreateMultipartFormData(data, form_data, error_message)) {
-            return false;
-        }
-
-        // Read dump file
-        std::vector<char> dump_data;
-        if (!FileUtils::ReadToBuffer(data.dump_path, dump_data, error_message)) {
-            return false;
-        }
-
-        // Create form footer
-        const std::string footer = std::string(CRLF) + std::string(BOUNDARY) + "--";
-        std::vector<char> form_footer(footer.begin(), footer.end());
-
         // Set HTTP headers
         const std::wstring headers = 
             L"Content-Type: multipart/form-data; boundary=MULTIPART-DATA-BOUNDARY\r\n"
@@ -124,8 +108,14 @@ bool HttpClient::SendCrashReport(const CrashReportData& data, std::string& error
             return false;
         }
 
+        // Prepare multipart form data
+        std::vector<char> form_data;
+        if (!CreateMultipartFormData(data, form_data, error_message)) {
+            return false;
+        }
+
         // Calculate total content length
-        const auto total_length = static_cast<DWORD>(form_data.size() + dump_data.size() + form_footer.size());
+        const auto total_length = static_cast<DWORD>(form_data.size());
         Logger::LogDebug("Total upload size: " + std::to_string(total_length) + " bytes");
 
         // Prepare request
@@ -145,18 +135,6 @@ bool HttpClient::SendCrashReport(const CrashReportData& data, std::string& error
         // Send form header
         if (!InternetWriteFile(request.get(), form_data.data(), static_cast<DWORD>(form_data.size()), &bytes_written)) {
             error_message = "Failed to upload form data";
-            return false;
-        }
-
-        // Send dump file
-        if (!InternetWriteFile(request.get(), dump_data.data(), static_cast<DWORD>(dump_data.size()), &bytes_written)) {
-            error_message = "Failed to upload dump file";
-            return false;
-        }
-
-        // Send form footer
-        if (!InternetWriteFile(request.get(), form_footer.data(), static_cast<DWORD>(form_footer.size()), &bytes_written)) {
-            error_message = "Failed to upload form footer";
             return false;
         }
 
@@ -212,55 +190,43 @@ bool HttpClient::CreateMultipartFormData(const CrashReportData& data, std::vecto
     try {
         output.clear();
 
-        auto append_string = [&output](std::string_view str) {
-            output.insert(output.end(), str.begin(), str.end());
-        };
-
-        auto append_wide_string = [&output](const std::wstring& wstr) {
-            const std::string utf8_str = TextUtils::WideToUtf8(wstr);
-            output.insert(output.end(), utf8_str.begin(), utf8_str.end());
-        };
-
         // Add version field
-        append_string(BOUNDARY);
-        append_string(CRLF);
-        append_string("Content-Disposition: form-data; name=\"CRVersion\"");
-        append_string(CRLF);
-        append_string(CRLF);
-        append_wide_string(data.version);
-        append_string(CRLF);
+        TextUtils::AppendString(output, BOUNDARY);
+        TextUtils::AppendString(output, CRLF);
+        TextUtils::AppendString(output, "Content-Disposition: form-data; name=\"CRVersion\"");
+        TextUtils::AppendString(output, CRLF);
+        TextUtils::AppendString(output, CRLF);
+        TextUtils::AppendString(output, data.version);
+        TextUtils::AppendString(output, CRLF);
 
         // Add error field
-        append_string(BOUNDARY);
-        append_string(CRLF);
-        append_string("Content-Disposition: form-data; name=\"error\"");
-        append_string(CRLF);
-        append_string(CRLF);
-        append_wide_string(data.error);
-        append_string(CRLF);
+        TextUtils::AppendString(output, BOUNDARY);
+        TextUtils::AppendString(output, CRLF);
+        TextUtils::AppendString(output, "Content-Disposition: form-data; name=\"error\"");
+        TextUtils::AppendString(output, CRLF);
+        TextUtils::AppendString(output, CRLF);
+        TextUtils::AppendString(output, data.error);
+        TextUtils::AppendString(output, CRLF);
 
-        // Add dump file field
-        append_string(BOUNDARY);
-        append_string(CRLF);
-        append_string("Content-Disposition: form-data; name=\"dumpfile\"; filename=\"");
-
-        // Extract filename from path
-        try {
-            const std::filesystem::path path(data.dump_path);
-            const std::wstring filename = path.filename().wstring();
-            append_wide_string(filename);
-        }
-        catch (...) {
-            // Fallback: use the whole path as filename
-            append_wide_string(data.dump_path);
+        if (!data.dump_path.empty() && !AddFileToMultipartData("dumpfile", data.dump_path, output, error_message)) {
+            return false;
         }
 
-        append_string("\"");
-        append_string(CRLF);
-        append_string("Content-Type: application/octet-stream");
-        append_string(CRLF);
-        append_string(CRLF);
+        if (!data.game_log_path.empty() && !AddFileToMultipartData("gamelog", data.game_log_path, output, error_message)) {
+            // Not-crtitical failure
+            Logger::LogError(error_message);
+            error_message = "";
+        }
+        
+        if (!data.network_log_path.empty() && !AddFileToMultipartData("networklog", data.network_log_path, output, error_message)) {
+            // Not-crtitical failure
+            Logger::LogError(error_message);
+            error_message = "";
+        }
 
+        // Create form footer
+        const std::string footer = std::string(CRLF) + std::string(BOUNDARY) + "--";
+        output.insert(output.end(), footer.begin(), footer.end());
         return true;
     }
     catch (const std::exception& e) {
@@ -273,6 +239,39 @@ bool HttpClient::CreateMultipartFormData(const CrashReportData& data, std::vecto
         output.clear();
         return false;
     }
+}
+
+bool HttpClient::AddFileToMultipartData(std::string_view name, std::wstring_view filepath, std::vector<char>& output, std::string& error_message) noexcept {
+    Logger::LogDebug(L"Try to add multipart data file: " + std::wstring(filepath));
+
+    // Add file field
+    TextUtils::AppendString(output, BOUNDARY);
+    TextUtils::AppendString(output, CRLF);
+    TextUtils::AppendString(output, "Content-Disposition: form-data; name=\"");
+    TextUtils::AppendString(output, name);
+    TextUtils::AppendString(output, "\"; filename=\"");
+
+    try {
+        // Extract filename from path
+        const std::filesystem::path path(filepath);
+        const std::wstring filename = path.filename().wstring();
+        TextUtils::AppendString(output, filename);
+    }
+    catch (...) {
+        // Fallback: use the whole path as filename
+        TextUtils::AppendString(output, filepath);
+    }
+
+    TextUtils::AppendString(output, "\"");
+    TextUtils::AppendString(output, CRLF);
+    TextUtils::AppendString(output, "Content-Type: application/octet-stream");
+    TextUtils::AppendString(output, CRLF);
+    TextUtils::AppendString(output, CRLF);
+
+    if (!FileUtils::AppendToBuffer(filepath, output, error_message)) {
+        return false;
+    }
+    return true;
 }
 
 } // namespace CrashSender

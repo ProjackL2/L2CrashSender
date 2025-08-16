@@ -57,7 +57,7 @@ struct FileUtils {
      * @return File size in bytes, -1 on error
      */
     [[nodiscard]]
-    static bool ReadToBuffer(std::wstring_view filename, std::vector<char>& buffer, std::string& error_message) noexcept;
+    static bool AppendToBuffer(std::wstring_view filename, std::vector<char>& buffer, std::string& error_message) noexcept;
 
     /**
      * @brief Cleanup temporary files used in crash reporting
@@ -74,6 +74,9 @@ struct TextUtils {
      * @return UTF-8 encoded string, empty on failure
      */
     static std::string WideToUtf8(std::wstring_view wstr) noexcept;
+
+    static void AppendString(std::vector<char>& output, std::string_view str) noexcept;
+    static void AppendString(std::vector<char>& output, std::wstring_view wstr) noexcept;
 };
 
 
