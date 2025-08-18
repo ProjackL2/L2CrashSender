@@ -80,19 +80,29 @@ int64_t FileUtils::GetFileSize(std::wstring_view filename) noexcept {
     }
 }
 
+bool BypassSharingViolation(std::wstring_view filepath, HANDLE & file_handle)
+{
+    CopyFileW(filepath.data(), L"L2Second.log", TRUE);
+    file_handle = CreateFileW(L"L2Second.log", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    return file_handle != INVALID_HANDLE_VALUE;
+}
+
 bool FileUtils::AppendToBuffer(std::wstring_view filepath, std::vector<char>& buffer, std::string& error_message) noexcept {
     const auto initinalSize = buffer.size();
 
     try {
-        const HANDLE file_handle = CreateFileW(filepath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE file_handle = CreateFileW(filepath.data(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (file_handle == INVALID_HANDLE_VALUE) {
             DWORD error = GetLastError();
             if (error == ERROR_SHARING_VIOLATION) {
-                error_message = "Failed to open file(" + TextUtils::WideToUtf8(filepath) + "): File is busy with other process, need to patch process";
+                if (!BypassSharingViolation(filepath, file_handle)) {
+                    error_message = "Failed to open file(" + TextUtils::WideToUtf8(filepath) + "): File is busy with other process, need to patch process";
+                    return false;
+                }
             } else {
                 error_message = "Failed to open file: " + TextUtils::WideToUtf8(filepath);
+                return false;
             }
-            return false;
         }
 
         FileGuard guard{ file_handle };
